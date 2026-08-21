@@ -34,6 +34,12 @@ app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")
 
 # ==========================================
+# ВКЛЮЧАЕМ РЕЖИМ ОТЛАДКИ
+# ==========================================
+app.config['DEBUG'] = True
+app.config['PROPAGATE_EXCEPTIONS'] = True
+
+# ==========================================
 # НАСТРОЙКА ЛОГИРОВАНИЯ
 # ==========================================
 logging.basicConfig(
@@ -1604,34 +1610,46 @@ def chat_api():
     return jsonify({'reply': reply})
 
 # ==========================================
-# ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК
+# ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК (С ДЕТАЛЬНЫМ ВЫВОДОМ)
 # ==========================================
 @app.errorhandler(Exception)
 def handle_exception(e):
+    import traceback
     school_name = session.get('school_name', 'Unknown')
     log_error_and_telegram(school_name, e, request.url)
-
+    
+    # Если запрос ожидает JSON — возвращаем JSON
     if request.headers.get('Content-Type') == 'application/json':
         return jsonify({
             'success': False,
             'error': str(e),
-            'details': 'Ошибка залогирована и отправлена администратору'
+            'traceback': traceback.format_exc()
         }), 500
-
+    
+    # Иначе показываем страницу с подробной ошибкой
     return f"""
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="UTF-8">
-        <title>Хатогӣ!</title>
+        <title>Хатогӣ</title>
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     </head>
-    <body class="p-4 text-center bg-light">
-        <div class="container mt-5">
-            <h1 class="text-danger">⚠️ Хатогӣ</h1>
-            <p class="lead">Чизе хато шуд! Администратор огоҳ карда шуд.</p>
-            <p class="text-muted small">Код: {e.__class__.__name__}</p>
-            <a href="/dashboard" class="btn btn-primary mt-3">Ба саҳифаи асосӣ</a>
+    <body class="p-4 bg-light">
+        <div class="container">
+            <div class="card border-danger">
+                <div class="card-header bg-danger text-white">
+                    <h4>⚠️ Хатогӣ дар система</h4>
+                </div>
+                <div class="card-body">
+                    <h5 class="text-danger">Типи хатогӣ: {e.__class__.__name__}</h5>
+                    <p><strong>Маълумот:</strong> {str(e)}</p>
+                    <hr>
+                    <h6>📍 Детали (traceback):</h6>
+                    <pre class="bg-dark text-light p-3" style="border-radius: 8px; overflow-x: auto; font-size: 13px;">{traceback.format_exc()}</pre>
+                    <a href="/dashboard" class="btn btn-primary mt-3">Ба саҳифаи асосӣ</a>
+                </div>
+            </div>
         </div>
     </body>
     </html>
