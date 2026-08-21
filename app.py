@@ -1188,9 +1188,22 @@ def update_status():
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db = get_db()
     cursor = db.cursor()
-    cursor.execute(adapt_query("INSERT OR REPLACE INTO school_status (username, last_seen) VALUES (?, ?)"),
-                   (username, now_str))
+    
+    if 'DATABASE_URL' in os.environ:
+        # PostgreSQL
+        cursor.execute("""
+            INSERT INTO school_status (username, last_seen) 
+            VALUES (%s, %s) 
+            ON CONFLICT (username) DO UPDATE SET last_seen = EXCLUDED.last_seen
+        """, (username, now_str))
+    else:
+        # SQLite
+        cursor.execute("INSERT OR REPLACE INTO school_status (username, last_seen) VALUES (?, ?)",
+                       (username, now_str))
+    
     db.commit()
+    if 'DATABASE_URL' in os.environ:
+        db.close()  # для PostgreSQL
     return jsonify({'success': True})
 
 @app.route('/admin', methods=['GET', 'POST'])
