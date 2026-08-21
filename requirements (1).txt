@@ -1,0 +1,6 @@
+Flask
+pandas
+openpyxl
+requests
+Werkzeug
+python-dotenv
