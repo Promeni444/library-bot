@@ -11,6 +11,7 @@ import csv
 import logging
 import traceback
 import sys
+import psycopg2
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, g, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -22,7 +23,9 @@ from flask_limiter.util import get_remote_address
 
 load_dotenv()
 
+# ==========================================
 # TELEGRAM НАСТРОЙКИ
+# ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_FILE = 'schools.db'
@@ -77,29 +80,48 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # ==========================================
-# УПРАВЛЕНИЕ БАЗОЙ ДАННЫХ В КОНТЕКСТЕ FLASK
+# АДАПТЕР ЗАПРОСОВ ДЛЯ РАЗНЫХ БАЗ ДАННЫХ
+# ==========================================
+def adapt_query(query):
+    """Заменяет ? на %s, если используется PostgreSQL"""
+    if 'DATABASE_URL' in os.environ:
+        return query.replace('?', '%s')
+    return query
+
+# ==========================================
+# УПРАВЛЕНИЕ БАЗОЙ ДАННЫХ
 # ==========================================
 def get_db():
-    if 'db' not in g:
-        g.db = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
-        g.db.execute('PRAGMA journal_mode=WAL;')
-        g.db.execute('PRAGMA synchronous=NORMAL;')
-        g.db.execute('PRAGMA busy_timeout=30000;')
-    return g.db
+    if 'DATABASE_URL' in os.environ:
+        # PostgreSQL на Render
+        conn = psycopg2.connect(os.environ['DATABASE_URL'])
+        return conn
+    else:
+        # SQLite локально
+        if 'db' not in g:
+            g.db = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
+            g.db.execute('PRAGMA journal_mode=WAL;')
+            g.db.execute('PRAGMA synchronous=NORMAL;')
+            g.db.execute('PRAGMA busy_timeout=30000;')
+        return g.db
 
 @app.teardown_appcontext
 def close_db(exception):
-    db = g.pop('db', None)
-    if db is not None:
-        db.close()
+    if 'DATABASE_URL' not in os.environ:
+        db = g.pop('db', None)
+        if db is not None:
+            db.close()
 
 def get_setting(key, default_val='on'):
     try:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
+        conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        cursor.execute(adapt_query("SELECT value FROM settings WHERE key = ?"), (key,))
         row = cursor.fetchone()
-        conn.close()
+        if 'DATABASE_URL' in os.environ:
+            conn.close()
+        else:
+            conn.close()
         return row[0] if row and row[0] else default_val
     except Exception:
         return default_val
@@ -165,31 +187,103 @@ def send_telegram_alert(school_name, text, event_type="info"):
         print(f"⚠️ Не удалось сформировать Telegram уведомление: {e}")
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT NOT NULL, role TEXT NOT NULL, name TEXT NOT NULL)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT, school TEXT, student_name TEXT, books TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS students (id INTEGER PRIMARY KEY AUTOINCREMENT, school TEXT, student_id TEXT, name TEXT, grade TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS school_status (username TEXT PRIMARY KEY, last_seen TEXT)''')
+    if 'DATABASE_URL' in os.environ:
+        # PostgreSQL
+        conn = psycopg2.connect(os.environ['DATABASE_URL'])
+        cursor = conn.cursor()
+        # Создание таблиц
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL,
+                name TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS history (
+                id SERIAL PRIMARY KEY,
+                time TEXT,
+                school TEXT,
+                student_name TEXT,
+                books TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS students (
+                id SERIAL PRIMARY KEY,
+                school TEXT,
+                student_id TEXT,
+                name TEXT,
+                grade TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS school_status (
+                username TEXT PRIMARY KEY,
+                last_seen TEXT
+            )
+        ''')
+        # Индексы
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_students_school ON students (school)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_students_student_id ON students (student_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_school ON history (school)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_role ON users (role)')
 
-    cursor.execute('''CREATE INDEX IF NOT EXISTS idx_students_school ON students (school)''')
-    cursor.execute('''CREATE INDEX IF NOT EXISTS idx_students_student_id ON students (student_id)''')
-    cursor.execute('''CREATE INDEX IF NOT EXISTS idx_history_school ON history (school)''')
-    cursor.execute('''CREATE INDEX IF NOT EXISTS idx_users_role ON users (role)''')
+        # Настройки
+        for key in ['alert_issue', 'alert_book_error', 'alert_system_error', 'alert_student_error', 'alert_upload_success']:
+            cursor.execute("INSERT INTO settings (key, value) VALUES (%s, 'on') ON CONFLICT (key) DO NOTHING", (key,))
 
-    for key in ['alert_issue', 'alert_book_error', 'alert_system_error', 'alert_student_error', 'alert_upload_success']:
-        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, 'on')", (key,))
+        # Суперадмин и тестовая школа
+        cursor.execute("""
+            INSERT INTO users (username, password, role, name) 
+            VALUES (%s, %s, %s, %s) 
+            ON CONFLICT (username) DO UPDATE SET password=EXCLUDED.password, role=EXCLUDED.role, name=EXCLUDED.name
+        """, ('superadmin', generate_password_hash('AdminMaster2026!'), 'admin', 'Сармуҳаррири система'))
 
-    try:
-        cursor.execute("ALTER TABLE students ADD COLUMN student_id TEXT")
-    except sqlite3.OperationalError:
-        pass
+        cursor.execute("""
+            INSERT INTO users (username, password, role, name) 
+            VALUES (%s, %s, %s, %s) 
+            ON CONFLICT (username) DO NOTHING
+        """, ('devashtich-muassisa-14', generate_password_hash('123456'), 'school', 'Муассисаи №14 (Деваштич)'))
 
-    cursor.execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?)", ('superadmin', generate_password_hash('AdminMaster2026!'), 'admin', 'Сармуҳаррири система'))
-    cursor.execute("INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?)", ('devashtich-muassisa-14', generate_password_hash('123456'), 'school', 'Муассисаи №14 (Деваштич)'))
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
+        logger.info("✅ База данных PostgreSQL инициализирована")
+    else:
+        # SQLite
+        conn = sqlite3.connect(DB_FILE, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT NOT NULL, role TEXT NOT NULL, name TEXT NOT NULL)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT, school TEXT, student_name TEXT, books TEXT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS students (id INTEGER PRIMARY KEY AUTOINCREMENT, school TEXT, student_id TEXT, name TEXT, grade TEXT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS school_status (username TEXT PRIMARY KEY, last_seen TEXT)''')
+
+        cursor.execute('''CREATE INDEX IF NOT EXISTS idx_students_school ON students (school)''')
+        cursor.execute('''CREATE INDEX IF NOT EXISTS idx_students_student_id ON students (student_id)''')
+        cursor.execute('''CREATE INDEX IF NOT EXISTS idx_history_school ON history (school)''')
+        cursor.execute('''CREATE INDEX IF NOT EXISTS idx_users_role ON users (role)''')
+
+        for key in ['alert_issue', 'alert_book_error', 'alert_system_error', 'alert_student_error', 'alert_upload_success']:
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, 'on')", (key,))
+
+        try:
+            cursor.execute("ALTER TABLE students ADD COLUMN student_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        cursor.execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?)", ('superadmin', generate_password_hash('AdminMaster2026!'), 'admin', 'Сармуҳаррири система'))
+        cursor.execute("INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?)", ('devashtich-muassisa-14', generate_password_hash('123456'), 'school', 'Муассисаи №14 (Деваштич)'))
+        conn.commit()
+        conn.close()
+        logger.info("✅ База данных SQLite инициализирована")
 
 init_db()
 
@@ -1036,7 +1130,7 @@ def login():
 
         db = get_db()
         cursor = db.cursor()
-        cursor.execute("SELECT password, role, name FROM users WHERE username = ?", (username,))
+        cursor.execute(adapt_query("SELECT password, role, name FROM users WHERE username = ?"), (username,))
         user = cursor.fetchone()
 
         if user and check_password_hash(user[0], password):
@@ -1072,7 +1166,7 @@ def toggle_setting():
         try:
             db = get_db()
             cursor = db.cursor()
-            cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, val))
+            cursor.execute(adapt_query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)"), (key, val))
             db.commit()
             return jsonify({'success': True})
         except Exception:
@@ -1088,7 +1182,7 @@ def update_status():
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("INSERT OR REPLACE INTO school_status (username, last_seen) VALUES (?, ?)",
+    cursor.execute(adapt_query("INSERT OR REPLACE INTO school_status (username, last_seen) VALUES (?, ?)"),
                    (username, now_str))
     db.commit()
     return jsonify({'success': True})
@@ -1133,9 +1227,9 @@ def admin_panel():
                                 new_pass = str(row.iloc[1]).strip()
                                 new_name = str(row.iloc[2]).strip()
                                 if new_user and new_user.lower() != "nan" and new_pass and new_pass.lower() != "nan":
-                                    cursor.execute("SELECT username FROM users WHERE username = ?", (new_user,))
+                                    cursor.execute(adapt_query("SELECT username FROM users WHERE username = ?"), (new_user,))
                                     if not cursor.fetchone():
-                                        cursor.execute("INSERT INTO users VALUES (?, ?, ?, ?)",
+                                        cursor.execute(adapt_query("INSERT INTO users VALUES (?, ?, ?, ?)"),
                                                        (new_user, generate_password_hash(new_pass), 'school', new_name))
                                         count += 1
                         db.commit()
@@ -1159,7 +1253,7 @@ def admin_panel():
                 try:
                     db = get_db()
                     cursor = db.cursor()
-                    cursor.execute("INSERT INTO users VALUES (?, ?, ?, ?)",
+                    cursor.execute(adapt_query("INSERT INTO users VALUES (?, ?, ?, ?)"),
                                    (new_user.strip(), generate_password_hash(new_pass.strip()), 'school', new_name.strip()))
                     db.commit()
                     msg = f"Мактаб бо муваффақият илова шуд!"
@@ -1170,10 +1264,10 @@ def admin_panel():
 
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("SELECT username, name, role FROM users")
+    cursor.execute(adapt_query("SELECT username, name, role FROM users"))
     schools = cursor.fetchall()
 
-    cursor.execute("SELECT username, last_seen FROM school_status")
+    cursor.execute(adapt_query("SELECT username, last_seen FROM school_status"))
     status_dict = {row[0]: row[1] for row in cursor.fetchall()}
 
     schools_with_status = []
@@ -1190,7 +1284,7 @@ def admin_panel():
         schools_with_status.append((school[0], school[1], school[2], is_online, last_seen))
 
     settings_dict = {}
-    cursor.execute("SELECT key, value FROM settings")
+    cursor.execute(adapt_query("SELECT key, value FROM settings"))
     for row in cursor.fetchall():
         settings_dict[row[0]] = row[1]
 
@@ -1212,8 +1306,8 @@ def delete_school(username):
     if username != 'superadmin':
         db = get_db()
         cursor = db.cursor()
-        cursor.execute("DELETE FROM users WHERE username = ?", (username,))
-        cursor.execute("DELETE FROM school_status WHERE username = ?", (username,))
+        cursor.execute(adapt_query("DELETE FROM users WHERE username = ?"), (username,))
+        cursor.execute(adapt_query("DELETE FROM school_status WHERE username = ?"), (username,))
         db.commit()
         send_telegram_alert(session.get('school_name', 'Admin'), f"Удалена школа: {username}", "system_error")
     return redirect(url_for('admin_panel'))
@@ -1225,11 +1319,11 @@ def dashboard():
     cursor = db.cursor()
 
     try:
-        cursor.execute("SELECT id, student_id, name, grade FROM students WHERE school = ?", (session.get('school_name'),))
+        cursor.execute(adapt_query("SELECT id, student_id, name, grade FROM students WHERE school = ?"), (session.get('school_name'),))
         rows = cursor.fetchall()
         students = [{"id": r[1] if r[1] else r[0], "name": r[2], "grade": r[3]} for r in rows]
     except Exception:
-        cursor.execute("SELECT id, name, grade FROM students WHERE school = ?", (session.get('school_name'),))
+        cursor.execute(adapt_query("SELECT id, name, grade FROM students WHERE school = ?"), (session.get('school_name'),))
         rows = cursor.fetchall()
         students = [{"id": r[0], "name": r[1], "grade": r[2]} for r in rows]
 
@@ -1291,10 +1385,8 @@ def upload_students_page():
                             st_grade = str(row[col_map["grade"]]).strip()
 
                             if st_name and st_name.lower() != "nan":
-                                cursor.execute(
-                                    "INSERT INTO students (school, student_id, name, grade) VALUES (?, ?, ?, ?)",
-                                    (school_name, st_id, st_name, st_grade),
-                                )
+                                cursor.execute(adapt_query("INSERT INTO students (school, student_id, name, grade) VALUES (?, ?, ?, ?)"),
+                                               (school_name, st_id, st_name, st_grade))
                                 count += 1
 
                         db.commit()
@@ -1314,7 +1406,7 @@ def clear_students():
     if not session.get('logged_in') or session.get('role') == 'admin': return redirect(url_for('login'))
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("DELETE FROM students WHERE school = ?", (session.get('school_name'),))
+    cursor.execute(adapt_query("DELETE FROM students WHERE school = ?"), (session.get('school_name'),))
     db.commit()
     send_telegram_alert(session.get('school_name'), f"Удалены все ученики школы", "system_error")
     return redirect(url_for('upload_students_page', msg='cleared'))
@@ -1351,7 +1443,7 @@ def issue_books():
         # Сохраняем в локальную историю
         db = get_db()
         cursor = db.cursor()
-        cursor.execute("INSERT INTO history (time, school, student_name, books) VALUES (?, ?, ?, ?)",
+        cursor.execute(adapt_query("INSERT INTO history (time, school, student_name, books) VALUES (?, ?, ?, ?)"),
                        (now_str, session.get('school_name'), f"{student_name} (ID: {student_id})", books_json))
         db.commit()
 
@@ -1426,7 +1518,7 @@ def history():
     if not session.get('logged_in') or session.get('role') == 'admin': return redirect(url_for('login'))
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("SELECT id, time, student_name, books FROM history WHERE school = ? ORDER BY id DESC", (session.get('school_name'),))
+    cursor.execute(adapt_query("SELECT id, time, student_name, books FROM history WHERE school = ? ORDER BY id DESC"), (session.get('school_name'),))
     rows = cursor.fetchall()
     history_list = [{'id': r[0], 'time': r[1], 'student_name': r[2], 'books': json.loads(r[3]) if r[3] else []} for r in rows]
     return render_template_string(HISTORY_TEMPLATE, history=history_list)
@@ -1436,7 +1528,7 @@ def delete_history(record_id):
     if not session.get('logged_in'): return redirect(url_for('login'))
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("DELETE FROM history WHERE id = ? AND school = ?", (record_id, session.get('school_name')))
+    cursor.execute(adapt_query("DELETE FROM history WHERE id = ? AND school = ?"), (record_id, session.get('school_name')))
     db.commit()
     return redirect(url_for('history'))
 
@@ -1445,7 +1537,7 @@ def clear_history():
     if not session.get('logged_in'): return redirect(url_for('login'))
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("DELETE FROM history WHERE school = ?", (session.get('school_name'),))
+    cursor.execute(adapt_query("DELETE FROM history WHERE school = ?"), (session.get('school_name'),))
     db.commit()
     return redirect(url_for('history'))
 
