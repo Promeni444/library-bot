@@ -1,6 +1,10 @@
-Flask
+flask
+flask-compress
+flask-limiter
 pandas
 openpyxl
 requests
-Werkzeug
+qrcode
 python-dotenv
+gunicorn
+psycopg2-binary
